@@ -5997,13 +5997,28 @@ export class PremiereProTools {
 
   // Undo Implementation
   private async undo(): Promise<any> {
+    // AMBIGUITY PATCH: qe.project.undo() reports success but does not actually undo on
+    // Premiere 26.x (verified: a razor cut survived it). Prefer the real Undo menu command,
+    // resolved BY NAME via findMenuCommandId - no command-ID guessing.
     const script = `
       try {
-        app.enableQE();
-        qe.project.undo();
+        var method = null;
+        if (app.findMenuCommandId && app.executeCommand) {
+          var undoId = app.findMenuCommandId("Undo");
+          if (undoId) { app.executeCommand(undoId); method = "menuCommand:" + undoId; }
+        }
+        if (!method) {
+          app.enableQE();
+          qe.project.undo();
+          method = "qe.project.undo";
+        }
         return JSON.stringify({
           success: true,
-          message: "Undo performed"
+          message: "Undo performed",
+          method: method,
+          warning: method === "qe.project.undo"
+            ? "Fell back to qe.project.undo(), which is known NOT to actually undo on Premiere 26.x. Verify by reading state back."
+            : null
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: e.toString() });
