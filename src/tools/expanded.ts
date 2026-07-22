@@ -287,17 +287,45 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
     function findClip(nodeId) {
       var seq = targetSequence() || activeSequence();
       if (!seq) return null;
+      // AMBIGUITY PATCH 2026-07-22: this used to match on "!nodeId ||", so ANY caller that
+      // passed a null/undefined id silently got the FIRST clip on the FIRST track instead of
+      // an error. get_clip_at_playhead did exactly that and reported clip 0 while the playhead
+      // sat at 123s, which caused a trim to be applied to the wrong shot. Refuse instead.
+      if (!nodeId) return null;
       function scan(collection, type) {
         for (var t = 0; t < collection.numTracks; t++) {
           var track = collection[t];
           for (var c = 0; c < track.clips.numItems; c++) {
             var clip = track.clips[c];
-            if (!nodeId || clip.nodeId === nodeId || clip.name === nodeId) {
+            if (clip.nodeId === nodeId || clip.name === nodeId) {
               return { clip: clip, track: track, trackIndex: t, clipIndex: c, trackType: type, sequence: seq };
             }
           }
         }
         return null;
+      }
+      return scan(seq.videoTracks, "video") || scan(seq.audioTracks, "audio");
+    }
+    // Find the clip whose span actually CONTAINS a given time. The old code had no such
+    // lookup at all -- it set args.time and then ignored it.
+    function findClipAtTime(seq, timeSec, preferredType) {
+      if (!seq) return null;
+      function scan(collection, type) {
+        for (var t = 0; t < collection.numTracks; t++) {
+          var track = collection[t];
+          for (var c = 0; c < track.clips.numItems; c++) {
+            var clip = track.clips[c];
+            var s = valueOfTime(clip.start);
+            var e = valueOfTime(clip.end);
+            if (s !== null && e !== null && timeSec >= s && timeSec < e) {
+              return { clip: clip, track: track, trackIndex: t, clipIndex: c, trackType: type, sequence: seq };
+            }
+          }
+        }
+        return null;
+      }
+      if (preferredType === "audio") {
+        return scan(seq.audioTracks, "audio") || scan(seq.videoTracks, "video");
       }
       return scan(seq.videoTracks, "video") || scan(seq.audioTracks, "audio");
     }
@@ -460,15 +488,32 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
           return ok(sequenceStructure(targetSequence()));
 
         case "get_timeline_summary":
-          var sumSeq = targetSequence();
-          var structure = sequenceStructure(sumSeq);
-          var videoClips = 0;
-          var audioClips = 0;
-          if (structure) {
-            for (var sv = 0; sv < structure.videoTracks.length; sv++) videoClips += structure.videoTracks[sv].clipCount;
-            for (var sa = 0; sa < structure.audioTracks.length; sa++) audioClips += structure.audioTracks[sa].clipCount;
+          // AMBIGUITY PATCH 2026-07-22: this reported videoClips:5 when the timeline actually
+          // held 4 -- the same code path returned a different answer moments later. Premiere's
+          // scripting objects can serve a STALE view right after a mutation. We cannot fix
+          // Premiere's internals, but we can refuse to report a single unverified number:
+          // read twice and say plainly whether the two agree.
+          function summarise() {
+            var st = sequenceStructure(targetSequence());
+            var v = 0, a = 0;
+            if (st) {
+              for (var i1 = 0; i1 < st.videoTracks.length; i1++) v += st.videoTracks[i1].clipCount;
+              for (var i2 = 0; i2 < st.audioTracks.length; i2++) a += st.audioTracks[i2].clipCount;
+            }
+            return { st: st, v: v, a: a };
           }
-          return ok({ sequence: structure ? { name: structure.name, id: structure.id, durationSeconds: structure.durationSeconds } : null, videoClips: videoClips, audioClips: audioClips });
+          var pass1 = summarise();
+          var pass2 = summarise();
+          var stable = (pass1.v === pass2.v && pass1.a === pass2.a);
+          var structure = pass2.st;
+          return ok({
+            sequence: structure ? { name: structure.name, id: structure.id, durationSeconds: structure.durationSeconds } : null,
+            videoClips: pass2.v,
+            audioClips: pass2.a,
+            stable: stable,
+            firstRead: stable ? undefined : { videoClips: pass1.v, audioClips: pass1.a },
+            warning: stable ? undefined : "Two consecutive reads disagreed -- Premiere returned a stale view. Re-read before acting on these counts."
+          });
 
         case "get_sequence_count":
           return ok({ count: app.project && app.project.sequences ? app.project.sequences.numSequences : 0 });
@@ -667,11 +712,22 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
           return fail("Premiere's addTracks scripting API can block CEP execution in this bridge. Use the existing add_track tool for one track at a time.");
 
         case "get_clip_at_playhead":
-          var playSeq = activeSequence();
+          var playSeq = targetSequence() || activeSequence();
           if (!playSeq) return fail("No active sequence");
-          args.time = ticksToSeconds(playSeq.getPlayerPosition().ticks);
-          var clipAt = findClip(null);
-          return ok(clipAt ? clipInfo(clipAt.clip, clipAt.trackType, clipAt.trackIndex, clipAt.clipIndex) : null);
+          var playheadSec = ticksToSeconds(playSeq.getPlayerPosition().ticks);
+          var wantType = String(args.track_type || args.trackType || "video");
+          var clipAt = findClipAtTime(playSeq, playheadSec, wantType);
+          if (!clipAt) {
+            // Honest empty answer beats a confidently wrong clip.
+            return ok({ clip: null, playheadSeconds: playheadSec, sequence: playSeq.name,
+                        message: "No clip under the playhead at " + playheadSec + "s" });
+          }
+          var atInfo = clipInfo(clipAt.clip, clipAt.trackType, clipAt.trackIndex, clipAt.clipIndex);
+          atInfo.playheadSeconds = playheadSec;
+          // Self-check: the returned clip MUST contain the playhead. If this ever trips,
+          // the lookup is wrong again and the caller needs to know rather than act on it.
+          atInfo.containsPlayhead = (atInfo.start <= playheadSec && playheadSec < atInfo.end);
+          return ok(atInfo);
 
         case "get_full_clip_info":
         case "get_clip_speed":

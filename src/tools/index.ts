@@ -1269,7 +1269,7 @@ export class PremiereProTools {
         case 'add_to_timeline_batch':
           return await this.addToTimelineBatch(args.sequenceId, args.clips);
         case 'remove_from_timeline':
-          return await this.removeFromTimeline(args.clipId, args.sequenceId, args.deleteMode);
+          return await this.removeFromTimeline(args.clipId, args.sequenceId, args.deleteMode, args.removeLinked);
         case 'move_clip':
           return await this.moveClip(args.clipId, args.newTime, args.newTrackIndex);
         case 'trim_clip':
@@ -2711,7 +2711,7 @@ export class PremiereProTools {
     }
   }
 
-  private async removeFromTimeline(clipId: string, sequenceId?: string, deleteMode = 'ripple'): Promise<any> {
+  private async removeFromTimeline(clipId: string, sequenceId?: string, deleteMode = 'ripple', removeLinked = true): Promise<any> {
     const script = `
       try {
         var info = __findClip(${JSON.stringify(clipId)}, ${sequenceId ? JSON.stringify(sequenceId) : 'null'});
@@ -2719,15 +2719,80 @@ export class PremiereProTools {
         var clip = info.clip;
         var clipName = clip.name;
         var isRipple = ${JSON.stringify(deleteMode)} === "ripple";
-        clip.remove(isRipple, true);
+        var removeLinked = ${JSON.stringify(removeLinked)} !== false;
+        var seq = info.sequence || app.project.activeSequence;
+
+        // AMBIGUITY PATCH 2026-07-22: two real defects fixed here.
+        //  (1) alignToVideo was hardcoded true even when NOT rippling. Asking for "lift" left
+        //      the video gap correctly but RIPPLED the linked audio 118.97 -> 60.03s.
+        //      alignToVideo only makes sense while rippling, so it now tracks isRipple.
+        //  (2) the linked audio was never removed at all -- deleting a video clip left its
+        //      audio orphaned on the timeline and required a second call. Now handled.
+        function snapshot() {
+          var out = [];
+          function scan(collection, type) {
+            for (var t = 0; t < collection.numTracks; t++) {
+              for (var c = 0; c < collection[t].clips.numItems; c++) {
+                var k = collection[t].clips[c];
+                out.push({ nodeId: k.nodeId, name: k.name, type: type, trackIndex: t,
+                           start: Number(k.start.seconds), end: Number(k.end.seconds) });
+              }
+            }
+          }
+          try { scan(seq.videoTracks, "video"); scan(seq.audioTracks, "audio"); } catch (e) {}
+          return out;
+        }
+        var before = snapshot();
+
+        // Collect linked partners BEFORE removing -- the handle dies with the clip.
+        var linkedIds = [];
+        if (removeLinked) {
+          try {
+            if (clip.getLinkedItems) {
+              var linked = clip.getLinkedItems();
+              for (var li = 0; li < linked.numItems; li++) {
+                if (linked[li].nodeId !== clip.nodeId) linkedIds.push(linked[li].nodeId);
+              }
+            }
+          } catch (e) {}
+        }
+
+        clip.remove(isRipple, isRipple);
+
+        var removedLinked = [];
+        for (var q = 0; q < linkedIds.length; q++) {
+          try {
+            var partner = __findClip(linkedIds[q], null);
+            if (partner && partner.clip) { partner.clip.remove(isRipple, isRipple); removedLinked.push(linkedIds[q]); }
+          } catch (e) {}
+        }
+
+        // Verify against reality rather than trusting remove()'s return.
+        var after = snapshot();
+        var stillThere = false;
+        var moved = [];
+        for (var a = 0; a < after.length; a++) {
+          if (after[a].nodeId === ${JSON.stringify(clipId)}) stillThere = true;
+          for (var b = 0; b < before.length; b++) {
+            if (before[b].nodeId === after[a].nodeId && Math.abs(before[b].start - after[a].start) > 0.005) {
+              moved.push({ nodeId: after[a].nodeId, name: after[a].name,
+                           from: before[b].start, to: after[a].start });
+            }
+          }
+        }
         return JSON.stringify({
-          success: true,
-          message: "Clip removed from timeline",
+          success: !stillThere,
+          message: stillThere ? "remove() returned but the clip is STILL on the timeline" : "Clip removed from timeline",
           clipId: ${JSON.stringify(clipId)},
           clipName: clipName,
           sequenceId: info.sequenceId,
           sequenceName: info.sequenceName,
-          deleteMode: ${JSON.stringify(deleteMode)}
+          deleteMode: ${JSON.stringify(deleteMode)},
+          removedLinked: removedLinked,
+          clipCountBefore: before.length,
+          clipCountAfter: after.length,
+          movedClips: moved,
+          unexpectedRipple: (!isRipple && moved.length > 0)
         });
       } catch (e) {
         return JSON.stringify({
@@ -5604,11 +5669,31 @@ export class PremiereProTools {
       try {
         var seq = app.project.activeSequence;
         if (!seq) return JSON.stringify({ success: false, error: "No active sequence" });
+        // AMBIGUITY PATCH 2026-07-22: seq.end can be STALE -- it reported 60.03 and then
+        // 129.73 for the same unedited sequence, disagreeing with get_sequence_structure.
+        // Derive the real end by scanning content (ground truth), and surface seq.end
+        // separately so a disagreement is visible instead of silently picking one.
+        var contentEnd = 0;
+        function scanEnd(collection) {
+          for (var t = 0; t < collection.numTracks; t++) {
+            var track = collection[t];
+            for (var c = 0; c < track.clips.numItems; c++) {
+              var e = track.clips[c].end;
+              var sec = (e && e.seconds !== undefined) ? Number(e.seconds) : __ticksToSeconds(e);
+              if (sec > contentEnd) contentEnd = sec;
+            }
+          }
+        }
+        try { scanEnd(seq.videoTracks); scanEnd(seq.audioTracks); } catch (scanErr) {}
+        var reportedEnd = __ticksToSeconds(seq.end);
         return JSON.stringify({
           success: true,
           id: seq.sequenceID,
           name: seq.name,
-          duration: __ticksToSeconds(seq.end),
+          duration: contentEnd,
+          durationSource: "content-scan",
+          reportedEnd: reportedEnd,
+          endIsStale: Math.abs(reportedEnd - contentEnd) > 0.005,
           videoTrackCount: seq.videoTracks.numTracks,
           audioTrackCount: seq.audioTracks.numTracks
         });
@@ -6016,35 +6101,87 @@ export class PremiereProTools {
   }
 
   // Undo Implementation
+  //
+  // AMBIGUITY PATCH 2026-07-22 (rewritten). History of this verb:
+  //   * qe.project.undo() returns success and does NOTHING on 26.x (verified repeatedly).
+  //   * app.findMenuCommandId("Undo") is an AFTER EFFECTS API -- absent in Premiere's CEP.
+  //   * A REAL Ctrl+Z does work, and it does undo script-driven clip edits.
+  //
+  // So this now sends genuine hardware-level input via scripts/win-send-shortcut.ps1, and --
+  // crucially -- VERIFIES by snapshotting the timeline before and after. The old verb's real
+  // sin was not that it failed, but that it reported success while failing.
+  //
+  // KNOWN LIMIT (measured): foregrounding the window is NOT sufficient. Premiere only acts on
+  // Ctrl+Z when a panel actually holds keyboard focus, which a click provides and
+  // SetForegroundWindow does not. When no panel has focus the keystroke is swallowed --
+  // which is exactly why this verifies instead of assuming. If it reports changed:false,
+  // click the timeline panel once and call it again.
+  //
+  // ALSO: scripted MARKER and KEYFRAME changes do not appear to enter Premiere's undo stack
+  // at all, so undo cannot reverse those. Clip add/remove/trim do enter it.
   private async undo(): Promise<any> {
-    // AMBIGUITY PATCH: qe.project.undo() reports success but does not actually undo on
-    // Premiere 26.x (verified: a razor cut survived it). Prefer the real Undo menu command,
-    // resolved BY NAME via findMenuCommandId - no command-ID guessing.
-    const script = `
+    const snapshotScript = `
       try {
-        var method = null;
-        if (app.findMenuCommandId && app.executeCommand) {
-          var undoId = app.findMenuCommandId("Undo");
-          if (undoId) { app.executeCommand(undoId); method = "menuCommand:" + undoId; }
+        var seq = app.project.activeSequence;
+        if (!seq) return JSON.stringify({ success: false, error: "No active sequence" });
+        var sig = [];
+        function scan(collection, type) {
+          for (var t = 0; t < collection.numTracks; t++) {
+            for (var c = 0; c < collection[t].clips.numItems; c++) {
+              var k = collection[t].clips[c];
+              sig.push(type + ":" + k.nodeId + ":" + Number(k.start.seconds).toFixed(3) + ":" + Number(k.end.seconds).toFixed(3));
+            }
+          }
         }
-        if (!method) {
-          app.enableQE();
-          qe.project.undo();
-          method = "qe.project.undo";
-        }
-        return JSON.stringify({
-          success: true,
-          message: "Undo performed",
-          method: method,
-          warning: method === "qe.project.undo"
-            ? "Fell back to qe.project.undo(), which is known NOT to actually undo on Premiere 26.x. Verify by reading state back."
-            : null
-        });
-      } catch (e) {
-        return JSON.stringify({ success: false, error: e.toString() });
-      }
+        scan(seq.videoTracks, "v"); scan(seq.audioTracks, "a");
+        return JSON.stringify({ success: true, signature: sig.join("|"), clipCount: sig.length });
+      } catch (e) { return JSON.stringify({ success: false, error: e.toString() }); }
     `;
-    return await this.bridge.executeScript(script);
+
+    const before: any = await this.bridge.executeScript(snapshotScript);
+
+    let sendResult: any = null;
+    try {
+      const { execFile } = await import('node:child_process');
+      const { fileURLToPath } = await import('node:url');
+      const path = await import('node:path');
+      const here = path.dirname(fileURLToPath(import.meta.url));
+      const ps = path.resolve(here, '..', '..', 'scripts', 'win-send-shortcut.ps1');
+      sendResult = await new Promise((resolve) => {
+        execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps,
+                                '-ProcessName', 'adobe premiere pro', '-Key', 'Z', '-Ctrl'],
+          { timeout: 20000 }, (err, stdout, stderr) => {
+            if (err && !stdout) return resolve({ success: false, error: String(stderr || err) });
+            try { resolve(JSON.parse(String(stdout).trim())); }
+            catch { resolve({ success: false, error: 'Unparseable output: ' + String(stdout) }); }
+          });
+      });
+    } catch (e: any) {
+      return { success: false, error: 'Could not run the Ctrl+Z helper: ' + String(e?.message || e) };
+    }
+
+    if (!sendResult?.success) {
+      return { success: false, error: 'Keystroke was not sent', detail: sendResult };
+    }
+
+    await new Promise((r) => setTimeout(r, 350));
+    const after: any = await this.bridge.executeScript(snapshotScript);
+
+    const beforeSig = before?.signature ?? null;
+    const afterSig = after?.signature ?? null;
+    const changed = beforeSig !== null && afterSig !== null && beforeSig !== afterSig;
+
+    return {
+      success: changed,
+      changed,
+      message: changed
+        ? 'Undo performed and verified against the timeline'
+        : 'Ctrl+Z was delivered but the timeline did not change. Either there was nothing undoable on the stack, or no Premiere panel had keyboard focus (foregrounding alone is not enough). Click the timeline panel once and retry.',
+      clipCountBefore: before?.clipCount ?? null,
+      clipCountAfter: after?.clipCount ?? null,
+      keystroke: sendResult,
+      note: 'Scripted marker and keyframe changes do not enter Premiere\'s undo stack and cannot be undone this way; clip add/remove/trim can.',
+    };
   }
 
   // Set Sequence In/Out Points Implementation
