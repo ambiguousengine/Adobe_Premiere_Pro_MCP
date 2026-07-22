@@ -371,16 +371,19 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
       return ok({ changed: changed, count: changed.length });
     }
     function commandByName(commandName) {
+      // AMBIGUITY PATCH: these returned success:true with available/skipped buried in the
+      // payload, so match_frame / lift / extract / link / unlink / remove_selected_clips all
+      // read as successful while doing nothing. app.findMenuCommandId is an After Effects
+      // API and does not exist in Premiere's CEP ExtendScript, so this path is always taken.
       if (!app.findMenuCommandId || !app.executeCommand) {
-        return ok({
-          available: false,
-          skipped: true,
-          command: commandName,
-          note: "Premiere menu command APIs are unavailable in this CEP ExtendScript context."
-        });
+        return fail("NOT_AVAILABLE: '" + commandName + "' needs Premiere menu-command APIs " +
+                    "(app.findMenuCommandId / app.executeCommand), which do not exist in this " +
+                    "CEP ExtendScript context. Nothing was changed.",
+                    { command: commandName, patched: "ambiguity-patches" });
       }
       var id = app.findMenuCommandId(commandName);
-      if (!id) return ok({ available: false, skipped: true, command: commandName, note: "Menu command not found." });
+      if (!id) return fail("NOT_AVAILABLE: menu command '" + commandName + "' not found. Nothing was changed.",
+                           { command: commandName, patched: "ambiguity-patches" });
       app.executeCommand(id);
       return ok({ command: commandName, commandId: id });
     }
