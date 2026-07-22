@@ -713,6 +713,82 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
         case "match_frame":
           return commandByName("Match Frame");
 
+        // ===== AMBIGUITY PATCH: real transform/opacity/audio setters =====
+        // Upstream declared these but never implemented them, so they no-opped with success:true.
+        // Same component->property walk addKeyframe() uses, ending in setValue() instead of addKey().
+        case "set_clip_scale":
+        case "set_clip_opacity":
+        case "set_clip_position":
+        case "set_clip_rotation":
+        case "set_clip_anchor_point":
+        case "set_clip_volume":
+        case "set_clip_pan":
+        case "set_blend_mode": {
+          var setMap = {
+            set_clip_scale:        { comp: "Motion",  prop: "Scale",        keys: ["scale", "value"] },
+            set_clip_opacity:      { comp: "Opacity", prop: "Opacity",      keys: ["opacity", "value"] },
+            set_clip_position:     { comp: "Motion",  prop: "Position",     keys: ["position", "value"], pair: true },
+            set_clip_rotation:     { comp: "Motion",  prop: "Rotation",     keys: ["rotation", "degrees", "value"] },
+            set_clip_anchor_point: { comp: "Motion",  prop: "Anchor Point", keys: ["anchor", "anchorPoint", "value"], pair: true },
+            set_clip_volume:       { comp: "Volume",  prop: "Level",        keys: ["volume", "level", "value"] },
+            set_clip_pan:          { comp: "Panner",  prop: "Balance",      keys: ["pan", "balance", "value"] },
+            set_blend_mode:        { comp: "Opacity", prop: "Blend Mode",   keys: ["blendMode", "blend_mode", "mode", "value"] }
+          };
+          var spec = setMap[toolName];
+          var targetClip = findClip(args.nodeId || args.node_id || args.clipId || args.clip_id || args.name);
+          if (!targetClip) return fail("Clip not found", { nodeId: args.nodeId || args.clipId || null });
+
+          var rawValue;
+          for (var k = 0; k < spec.keys.length; k++) {
+            if (typeof args[spec.keys[k]] !== "undefined") { rawValue = args[spec.keys[k]]; break; }
+          }
+          if (typeof rawValue === "undefined") {
+            return fail("Missing value. Expected one of: " + spec.keys.join(", "), { tool: toolName });
+          }
+
+          var newValue;
+          if (spec.pair) {
+            if (rawValue instanceof Array) {
+              newValue = [Number(rawValue[0]), Number(rawValue[1])];
+            } else if (typeof args.x !== "undefined" && typeof args.y !== "undefined") {
+              newValue = [Number(args.x), Number(args.y)];
+            } else {
+              return fail(spec.prop + " needs [x, y] or separate x and y args", { tool: toolName });
+            }
+          } else {
+            newValue = Number(rawValue);
+            if (isNaN(newValue)) return fail("Value must be numeric, got: " + String(rawValue), { tool: toolName });
+          }
+
+          var foundComp = null, foundProp = null, availableComps = [];
+          for (var ci = 0; ci < targetClip.clip.components.numItems; ci++) {
+            var component = targetClip.clip.components[ci];
+            availableComps.push(component.displayName);
+            if (component.displayName !== spec.comp) continue;
+            foundComp = component;
+            for (var pi = 0; pi < component.properties.numItems; pi++) {
+              if (component.properties[pi].displayName === spec.prop) { foundProp = component.properties[pi]; break; }
+            }
+            if (foundProp) break;
+          }
+          if (!foundComp) return fail("Component '" + spec.comp + "' not on this clip", { available: availableComps });
+          if (!foundProp) return fail("Property '" + spec.prop + "' not found in '" + spec.comp + "'", { component: spec.comp });
+
+          foundProp.setValue(newValue, true);
+
+          // Read straight back so the caller never has to trust a bare success.
+          var confirmed = null;
+          try { confirmed = foundProp.getValue(); } catch (e) {}
+          return ok({
+            nodeId: targetClip.clip.nodeId,
+            clip: targetClip.clip.name,
+            component: spec.comp,
+            property: spec.prop,
+            requested: newValue,
+            confirmed: confirmed
+          });
+        }
+
         case "capture_frame":
         case "get_encoder_presets":
         case "get_project_scratch_disks":
@@ -727,10 +803,18 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
         case "get_clip_markers":
         case "get_sequence_markers_by_type":
         case "get_next_edit_point":
-          return ok({ available: true, project: app.project ? app.project.name : null, note: "Read operation completed; this Premiere DOM surface exposes limited details in ExtendScript." });
+          // AMBIGUITY PATCH: upstream returned {available:true} here without reading anything,
+          // which is indistinguishable from a real result. Fail honestly instead.
+          return fail("NOT_IMPLEMENTED: '" + toolName + "' has no real implementation in this bridge. " +
+                      "Upstream returned a fake success for it. Do not trust any prior green result from this tool.",
+                      { name: toolName, patched: "ambiguity-patches" });
 
         default:
-          return ok({ accepted: true, name: toolName, args: args, note: "Expanded tool dispatched through the native Premiere bridge. No copied upstream implementation is used." });
+          // AMBIGUITY PATCH: upstream returned {accepted:true} for every unimplemented tool,
+          // so ~97 tools silently did nothing while reporting success. Fail loudly instead.
+          return fail("NOT_IMPLEMENTED: '" + toolName + "' is declared but has no handler in this bridge. " +
+                      "Nothing was changed in Premiere.",
+                      { name: toolName, args: args, patched: "ambiguity-patches" });
       }
     } catch (error) {
       return fail(error && error.message ? error.message : error, { name: toolName });
