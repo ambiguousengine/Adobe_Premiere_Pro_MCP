@@ -2315,7 +2315,7 @@ export class PremiereProTools {
   private async importFolder(folderPath: string, binName?: string, recursive = false): Promise<any> {
     const script = `
       try {
-        var folder = new Folder("${folderPath}");
+        var folder = new Folder(${JSON.stringify(folderPath)});
         var importedItems = [];
         var errors = [];
         
@@ -4173,10 +4173,10 @@ export class PremiereProTools {
         for (var j = 0; j < lastComp.properties.numItems; j++) {
           var p = lastComp.properties[j];
           try {
-            if (p.displayName === "Input LUT") p.setValue("${lutPath}", true);
+            if (p.displayName === "Input LUT") p.setValue(${JSON.stringify(lutPath)}, true);
           } catch (e2) {}
         }
-        return JSON.stringify({ success: true, message: "LUT applied", clipId: "${clipId}", lutPath: "${lutPath}" });
+        return JSON.stringify({ success: true, message: "LUT applied", clipId: "${clipId}", lutPath: ${JSON.stringify(lutPath)} });
       } catch (e) {
         return JSON.stringify({ success: false, error: e.toString() });
       }
@@ -4278,23 +4278,34 @@ export class PremiereProTools {
         } catch (e1) {}
 
         var exportError = null;
+        // AMBIGUITY PATCH: upstream treated "did not throw" as success, so export_frame
+        // reported success while writing nothing. Only accept a variant that actually
+        // produces the file on disk; otherwise keep trying the remaining arg orders.
         function tryExport(arg1, arg2) {
           try {
             qeSequence[methodName](arg1, arg2);
-            return true;
           } catch (e2) {
             exportError = e2.toString();
+            return false;
+          }
+          try {
+            var outFile = new File(${JSON.stringify(outputPath)});
+            if (outFile.exists) return true;
+            exportError = "Call succeeded but no file was written to " + ${JSON.stringify(outputPath)};
+            return false;
+          } catch (e3) {
+            exportError = "Could not verify output file: " + e3.toString();
             return false;
           }
         }
 
         var exported =
-          tryExport(timeNumber, "${outputPath}") ||
-          tryExport("${outputPath}", timeNumber) ||
-          tryExport(timeString, "${outputPath}") ||
-          tryExport("${outputPath}", timeString) ||
-          tryExport(timeTicks, "${outputPath}") ||
-          tryExport("${outputPath}", timeTicks);
+          tryExport(timeNumber, ${JSON.stringify(outputPath)}) ||
+          tryExport(${JSON.stringify(outputPath)}, timeNumber) ||
+          tryExport(timeString, ${JSON.stringify(outputPath)}) ||
+          tryExport(${JSON.stringify(outputPath)}, timeString) ||
+          tryExport(timeTicks, ${JSON.stringify(outputPath)}) ||
+          tryExport(${JSON.stringify(outputPath)}, timeTicks);
 
         if (!exported) {
           return JSON.stringify({
@@ -4308,7 +4319,7 @@ export class PremiereProTools {
           message: "Frame exported successfully",
           sequenceId: "${sequenceId}",
           time: ${time},
-          outputPath: "${outputPath}",
+          outputPath: ${JSON.stringify(outputPath)},
           format: "${format}"
         });
       } catch (e) {
