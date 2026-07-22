@@ -4433,20 +4433,109 @@ export class PremiereProTools {
     return await this.bridge.executeScript(script);
   }
 
+  // AMBIGUITY PATCH 2026-07-22: speed_change was broken for TWO independent reasons, both
+  // found by probing live Premiere 26.2.2 rather than trusting any repo's documentation.
+  //
+  // (1) QE INDICES ARE NOT EXTENDSCRIPT INDICES. QE's track.getItemAt() counts GAPS as items;
+  //     ExtendScript's track.clips collection does not. On the test sequence QE V1 held 8
+  //     items (3 of them type="Empty") for 5 real clips, so passing an ExtendScript clipIndex
+  //     straight into getItemAt() silently addressed the WRONG item -- in our case an empty
+  //     gap, which is why the clip name came back blank. Every QE DOM verb that maps
+  //     clipIndex -> getItemAt has this bug. We now match by START TIME instead, which is
+  //     stable regardless of gaps. (Both public forks of this project share the index bug.)
+  //
+  // (2) THE SIGNATURE IS setSpeed(percent, durationTIMECODE, reverse, audioPitch, ripple).
+  //     Probed exhaustively: 1, 2, 3 and 4 args all -> "Not Enough Parameters"; 5 args with a
+  //     numeric duration -> "Illegal Parameter type"; 5 args with duration as a TIMECODE
+  //     STRING -> works. No repo documents this. Passing '00:00:00:00' collapses the clip to
+  //     ~0 length, so the target duration must actually be computed.
   private async speedChange(clipId: string, speed: number, maintainAudio = true): Promise<any> {
+    const percent = speed * 100;
     const script = `
       try {
         app.enableQE();
-        var info = __findClip("${clipId}");
+        var info = __findClip(${JSON.stringify(clipId)});
         if (!info) return JSON.stringify({ success: false, error: "Clip not found" });
-        var oldSpeed = info.clip.getSpeed();
+        var startSec = Number(info.clip.start.seconds);
+        var endSec = Number(info.clip.end.seconds);
+        var oldDuration = endSec - startSec;
+
+        var seq = app.project.activeSequence;
+        var fps = 30;
+        try {
+          var tb = Number(seq.timebase);            // ticks per frame
+          if (tb > 0) fps = Math.round(254016000000 / tb);
+        } catch (eF) {}
+
         var qeSeq = qe.project.getActiveSequence();
-        var qeTrack = info.trackType === 'video' ? qeSeq.getVideoTrackAt(info.trackIndex) : qeSeq.getAudioTrackAt(info.trackIndex);
-        var qeClip = qeTrack.getItemAt(info.clipIndex);
-        try { qeClip.setSpeed(${speed}, ${maintainAudio}); } catch(e2) {
-          return JSON.stringify({ success: false, error: "Speed change via QE DOM not available: " + e2.toString() });
+        var qeTrack = info.trackType === 'video'
+          ? qeSeq.getVideoTrackAt(info.trackIndex)
+          : qeSeq.getAudioTrackAt(info.trackIndex);
+
+        // Match by time, skipping Empty items -- see note (1) above.
+        var qeClip = null, qeIndex = -1;
+        for (var i = 0; i < qeTrack.numItems; i++) {
+          var cand = qeTrack.getItemAt(i);
+          var ctype = "";
+          try { ctype = String(cand.type); } catch (eT) {}
+          if (ctype === "Empty") continue;
+          var cs = Number(cand.start.secs !== undefined ? cand.start.secs : -1);
+          if (Math.abs(cs - startSec) < 0.05) { qeClip = cand; qeIndex = i; break; }
         }
-        return JSON.stringify({ success: true, oldSpeed: oldSpeed, newSpeed: ${speed} });
+        if (!qeClip) return JSON.stringify({ success: false,
+          error: "Could not match a QE clip starting at " + startSec + "s (QE indices include gaps; matched by time)" });
+
+        // ⛔ REFUSING TO ACT. The QE clip is now correctly identified (see note (1)) and the
+        // arity is known (note (2)), but the SEMANTICS of parameter 2 are not. Every value
+        // tried -- '00:00:00:00', a computed target timecode, and a ticks string -- collapses
+        // the clip to ~5 frames regardless of what is passed. Measured three times on three
+        // different clips, each of which had to be restored with Ctrl+Z.
+        //
+        // A verb that silently destroys a clip is far worse than one that is missing, so this
+        // refuses until the parameter is understood. Everything needed to finish it is below:
+        // the correct QE item is resolved by time, fps is derived, and the call site is one
+        // line away. Do NOT re-enable it without verifying actualDuration against expected.
+        if (true) {
+          return JSON.stringify({
+            success: false,
+            error: "speed_change is disabled: QE setSpeed collapses the clip to ~5 frames whatever duration value is passed. Parameter 2's meaning is still unknown (timecode string, computed duration and ticks string all fail identically). Retime by hand until this is solved.",
+            resolved: { qeIndex: qeIndex, startSec: startSec, oldDuration: oldDuration, fps: fps },
+            knownSignature: "setSpeed(percent, <param2 UNKNOWN>, reverse, audioPitch, ripple) -- fewer than 5 args throws 'Not Enough Parameters'; a numeric param2 throws 'Illegal Parameter type'",
+            note: "QE track indices include Empty gap items and do NOT match ExtendScript clip indices -- this verb now matches by start time, which IS fixed and correct."
+          });
+        }
+
+        var newDuration = oldDuration * 100.0 / ${percent};
+        function tc(sec) {
+          var f = Math.round(sec * fps);
+          var ff = f % fps; var totalSec = Math.floor(f / fps);
+          var ss = totalSec % 60; var mm = Math.floor(totalSec / 60) % 60; var hh = Math.floor(totalSec / 3600);
+          function p2(n) { return (n < 10 ? "0" : "") + n; }
+          return p2(hh) + ":" + p2(mm) + ":" + p2(ss) + ":" + p2(ff);
+        }
+        var durTC = tc(newDuration);
+
+        try {
+          qeClip.setSpeed(${percent}, durTC, false, ${maintainAudio}, false);
+        } catch (e2) {
+          return JSON.stringify({ success: false, error: "QE setSpeed failed: " + e2.toString(),
+                                  attempted: { percent: ${percent}, duration: durTC } });
+        }
+
+        // Verify against the timeline; never trust the call returning quietly.
+        var after = __findClip(${JSON.stringify(clipId)});
+        var newActual = after ? (Number(after.clip.end.seconds) - Number(after.clip.start.seconds)) : null;
+        return JSON.stringify({
+          success: true,
+          speedPercent: ${percent},
+          fps: fps,
+          qeIndex: qeIndex,
+          oldDuration: oldDuration,
+          expectedDuration: newDuration,
+          actualDuration: newActual,
+          durationTimecode: durTC,
+          exact: newActual !== null && Math.abs(newActual - newDuration) < (1.5 / fps)
+        });
       } catch (e) {
         return JSON.stringify({ success: false, error: e.toString() });
       }
